@@ -4,14 +4,12 @@ use crate::journal::Journal;
 use crate::worker::{Worker, WorkerMessage};
 use config::Config;
 use notify::{RecursiveMode, Watcher};
-use std::{
-    error::Error,
-    path::PathBuf,
-    str::FromStr,
-    sync::{Arc, Mutex},
-};
+use std::time::Duration;
+use std::{error::Error, path::PathBuf, str::FromStr, sync::Arc};
+use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::level_filters::LevelFilter;
+use tracing::Instrument;
 
 mod config;
 mod journal;
@@ -56,22 +54,39 @@ async fn main() -> Result<(), std::io::Error> {
         }) {
         Ok(cfg) => cfg,
         Err(err) => {
-            tracing::error!(error = %err, "Invalid configuration file, loading defaults...");
-            Default::default()
+            panic!("Invalid configuration file: {err:?}");
         }
     };
 
     tracing::debug!(cfg = ?config, "Loaded config file");
 
-    let cancel = CancellationToken::new();
-    let journal = Arc::new(Mutex::new(Journal::new()));
+    let base_path = config.backup_path.clone();
+    if !base_path.is_dir() {
+        tracing::error!("The backup path should be a directory, not a file");
+        return Ok(());
+    }
 
-    let mut worker = Worker::new(cancel.clone(), journal);
-    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let mut journal_path = base_path.clone();
+    journal_path.push(".backdown.journal.json");
+
+    let cancel = CancellationToken::new();
+    let journal = Arc::new(RwLock::new(
+        Journal::new(journal_path)
+            .await
+            .expect("Failed to create journal"),
+    ));
+
+    let mut worker = Worker::new(
+        cancel.clone(),
+        Arc::clone(&journal),
+        base_path,
+        config.clone(),
+    );
+    let (tx, mut rx) = tokio::sync::mpsc::channel(32);
 
     let mut watcher = notify::recommended_watcher(move |res| match res {
         Ok(event) => {
-            tracing::info!(ev = ?event, "Filesystem event");
+            tracing::info!(ev = ?event, "Filesystem event.");
             tx.blocking_send(WorkerMessage::FilesystemEvent(event))
                 .expect("Failed to send message to actor thread");
         }
@@ -85,11 +100,40 @@ async fn main() -> Result<(), std::io::Error> {
             .expect("Failed to watch path");
     });
 
+    let interval_journal = Arc::clone(&journal);
+    let interval_cancel = cancel.clone();
+    let interval_span = tracing::info_span!("interval_flush");
+    let interval_handle = tokio::task::spawn(
+        async move {
+            let journal = interval_journal;
+            let cancel = interval_cancel;
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        tracing::info!("Flushing journal...");
+                        let mut journal = journal.write().await;
+                        if let Err(err) = journal.flush().await {
+                            tracing::error!(error = %err, "Failed to flush journal.");
+                        }
+                    },
+                    _ = cancel.cancelled() => {
+                        break;
+                    }
+                }
+            }
+        }
+        .instrument(interval_span),
+    );
+
     loop {
         tokio::select! {
             msg = rx.recv() => {
                 if let Some(msg) = msg {
-                    worker.send_message(msg).await;
+                    if let Err(err) = worker.send_message(msg).await {
+                        tracing::error!(error = %err, "Failed to send message to worker.");
+                        break;
+                    }
                 } else {
                     break
                 }
@@ -102,9 +146,25 @@ async fn main() -> Result<(), std::io::Error> {
 
     tracing::info!("Starting graceful shutdown...");
     cancel.cancel();
-    if let Err(err) = worker.wait_for_shutdown().await {
-        tracing::warn!(error = %err, "Worker task joined with error");
+
+    if let Err(err) = interval_handle.await {
+        tracing::warn!(error = %err, "Journal flush task joined with error.");
     }
+
+    if let Err(err) = worker.wait_for_shutdown().await {
+        tracing::warn!(error = %err, "Worker task joined with error.");
+    }
+
+    tracing::info!("Flushing journal...");
+    let flush_span = tracing::info_span!("journal_exit_flush");
+    let mut journal_lck = journal.write().await;
+    let flushed = journal_lck
+        .flush()
+        .instrument(flush_span)
+        .await
+        .expect("Failed to flush journal.");
+
+    tracing::info!(entries_flushed = flushed, "Journal flushed.");
 
     Ok(())
 }
