@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use self::error::JournalError;
 use crate::config::WatchPath;
 use serde::{Deserialize, Serialize};
@@ -93,18 +91,14 @@ impl Journal {
     {
         tracing::trace!("Creating new journal entry.");
 
-        let mut file = tokio::fs::File::open(&path).await?;
+        let file = tokio::fs::File::open(&path).await?;
         let meta = file.metadata().await?;
-        let buf_size = meta.len();
-        let mut buf = vec![0; buf_size as usize];
 
-        file.read_to_end(&mut buf).await?;
-        let sha256 = sha256::digest(&buf);
         let entry = JournalEntry {
             file_path: PathBuf::from(path.as_ref()),
             last_modified: meta.modified()?.duration_since(UNIX_EPOCH)?.as_secs(),
             watch_path: watch_path.path().to_owned(),
-            sha256,
+            old_versions: vec![],
         };
 
         self.entries.insert(entry.file_path.clone(), entry);
@@ -134,6 +128,10 @@ impl Journal {
         }
     }
 
+    pub fn is_dirty(&self) -> bool {
+        self.dirty_count != 0
+    }
+
     pub fn base_path(&self) -> &Path {
         &self.base_path
     }
@@ -161,7 +159,27 @@ pub struct JournalEntry {
     pub file_path: std::path::PathBuf,
     pub watch_path: std::path::PathBuf,
     pub last_modified: u64,
-    pub sha256: String,
+
+    #[serde(default = "Vec::default")]
+    pub old_versions: Vec<OldVersion>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OldVersion {
+    pub timestamp: u64,
+    pub file_path: std::path::PathBuf,
+}
+
+impl PartialOrd for OldVersion {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for OldVersion {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.timestamp.cmp(&other.timestamp)
+    }
 }
 
 pub struct EntryGuard<'a> {

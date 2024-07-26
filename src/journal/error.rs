@@ -1,6 +1,8 @@
 use thiserror::Error;
 
 #[derive(Debug, Error)]
+#[allow(dead_code)]
+#[non_exhaustive]
 pub enum JournalError {
     #[error("Duplicate entry")]
     DuplicateEntry,

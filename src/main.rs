@@ -38,7 +38,7 @@ fn config_location() -> PathBuf {
 #[tokio::main]
 async fn main() -> Result<(), std::io::Error> {
     tracing_subscriber::fmt()
-        .with_max_level(LevelFilter::TRACE)
+        .with_max_level(LevelFilter::INFO)
         .init();
 
     let span = tracing::info_span!("main");
@@ -76,17 +76,12 @@ async fn main() -> Result<(), std::io::Error> {
             .expect("Failed to create journal"),
     ));
 
-    let mut worker = Worker::new(
-        cancel.clone(),
-        Arc::clone(&journal),
-        base_path,
-        config.clone(),
-    );
+    let mut worker = Worker::new(cancel.clone(), Arc::clone(&journal), config.clone());
     let (tx, mut rx) = tokio::sync::mpsc::channel(32);
 
     let mut watcher = notify::recommended_watcher(move |res| match res {
         Ok(event) => {
-            tracing::info!(ev = ?event, "Filesystem event.");
+            tracing::trace!(ev = ?event, "Filesystem event.");
             tx.blocking_send(WorkerMessage::FilesystemEvent(event))
                 .expect("Failed to send message to actor thread");
         }
@@ -111,10 +106,16 @@ async fn main() -> Result<(), std::io::Error> {
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        tracing::info!("Flushing journal...");
-                        let mut journal = journal.write().await;
-                        if let Err(err) = journal.flush().await {
-                            tracing::error!(error = %err, "Failed to flush journal.");
+                        let journal_lck = journal.read().await;
+                        let is_dirty = journal_lck.is_dirty();
+                        drop(journal_lck);
+
+                        if is_dirty {
+                            tracing::info!("Flushing journal...");
+                            let mut journal = journal.write().await;
+                            if let Err(err) = journal.flush().await {
+                                tracing::error!(error = %err, "Failed to flush journal.");
+                            }
                         }
                     },
                     _ = cancel.cancelled() => {
