@@ -10,6 +10,9 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::level_filters::LevelFilter;
 use tracing::Instrument;
+use worker::file::FileHandler;
+use worker::intent::{IntentHandler, IntentList};
+use worker::message::MessageHandler;
 
 mod config;
 mod journal;
@@ -74,7 +77,16 @@ async fn main() -> Result<(), std::io::Error> {
             .expect("Failed to create journal"),
     ));
 
-    let mut worker = Worker::new(cancel.clone(), Arc::clone(&journal), config.clone());
+    let file_handler = FileHandler::new(config.clone(), Arc::clone(&journal));
+    let intent_handler = IntentHandler::new(file_handler.clone());
+    let message_handler = MessageHandler::new(
+        Arc::clone(&journal),
+        IntentList::new(),
+        intent_handler.clone(),
+        file_handler.clone(),
+    );
+
+    let mut worker = Worker::new(cancel.clone(), intent_handler.clone(), message_handler);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
     let mut watcher = notify::recommended_watcher(move |res| match res {
@@ -93,7 +105,9 @@ async fn main() -> Result<(), std::io::Error> {
             .expect("Failed to watch path");
     });
 
-    if let Err(err) = worker::Worker::rescan(config.clone(), Arc::clone(&journal)).await {
+    if let Err(err) =
+        worker::Worker::rescan(config.clone(), Arc::clone(&journal), intent_handler.clone()).await
+    {
         tracing::error!(error = %err, "Filesystem rescan failed.");
     }
 
@@ -145,7 +159,7 @@ async fn main() -> Result<(), std::io::Error> {
                 }
             },
             _ = rescan_interval.tick() => {
-                if let Err(err) = worker::Worker::rescan(config.clone(), Arc::clone(&journal)).await {
+                if let Err(err) = worker::Worker::rescan(config.clone(), Arc::clone(&journal), intent_handler.clone()).await {
                     tracing::error!(error = %err, "Filesystem rescan failed.");
                 }
             }

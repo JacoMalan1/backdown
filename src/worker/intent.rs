@@ -4,6 +4,10 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use thiserror::Error;
+
+use super::file::FileHandler;
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct WorkerIntent {
@@ -20,6 +24,7 @@ pub enum IntentKind {
     Modify,
 }
 
+#[derive(Debug)]
 pub struct IntentList {
     map: Arc<RwLock<HashMap<std::path::PathBuf, WorkerIntent>>>,
 }
@@ -31,12 +36,12 @@ impl IntentList {
         }
     }
 
-    pub fn create(&mut self, intent: WorkerIntent) {
+    pub fn create(&self, intent: WorkerIntent) {
         let mut map = self.map.write().unwrap_or_else(|err| err.into_inner());
         map.insert(intent.path.to_owned(), intent);
     }
 
-    pub fn remove<P>(&mut self, path: P) -> Option<WorkerIntent>
+    pub fn remove<P>(&self, path: P) -> Option<WorkerIntent>
     where
         P: AsRef<std::path::Path>,
     {
@@ -62,7 +67,7 @@ impl IntentList {
     }
 
     #[allow(dead_code)]
-    pub fn remove_stale(&mut self, max_age: Duration) -> Vec<WorkerIntent> {
+    pub fn remove_stale(&self, max_age: Duration) -> Vec<WorkerIntent> {
         let mut map = self.map.write().unwrap_or_else(|err| err.into_inner());
         let mut to_remove = vec![];
         map.iter().for_each(|(key, value)| {
@@ -87,5 +92,44 @@ impl Clone for IntentList {
         Self {
             map: Arc::clone(&self.map),
         }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum HandleIntentError {
+    #[error("Error while handling file event: {0}")]
+    HandleFile(#[from] super::file::HandleFileError),
+}
+
+#[derive(Debug, Clone)]
+pub struct IntentHandler {
+    file_handler: FileHandler,
+}
+
+impl IntentHandler {
+    pub fn new(file_handler: FileHandler) -> Self {
+        Self { file_handler }
+    }
+
+    pub async fn handle<P>(
+        &self,
+        file_path: P,
+        intent: WorkerIntent,
+    ) -> Result<(), HandleIntentError>
+    where
+        P: AsRef<std::path::Path>,
+    {
+        match intent {
+            WorkerIntent {
+                kind: IntentKind::Modify,
+                ..
+            } => self.file_handler.modify(&file_path).await?,
+            WorkerIntent {
+                kind: IntentKind::Create,
+                ..
+            } => self.file_handler.create(&file_path).await?,
+            _ => (),
+        }
+        Ok(())
     }
 }
