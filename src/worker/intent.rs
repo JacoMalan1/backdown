@@ -5,6 +5,7 @@ use std::{
 };
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct WorkerIntent {
     pub path: std::path::PathBuf,
     pub kind: IntentKind,
@@ -60,6 +61,7 @@ impl IntentList {
         self.len() == 0
     }
 
+    #[allow(dead_code)]
     pub fn remove_stale(&mut self, max_age: Duration) -> Vec<WorkerIntent> {
         let mut map = self.map.write().unwrap_or_else(|err| err.into_inner());
         let mut to_remove = vec![];

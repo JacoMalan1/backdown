@@ -13,7 +13,7 @@ pub struct Config {
 
 impl Config {
     pub fn default_fs_refresh_timeout_secs() -> u64 {
-        60
+        5 * 60
     }
 
     pub fn find_watch_path<P>(&self, needle: P) -> Option<&WatchPath>
@@ -36,5 +36,10 @@ pub struct WatchPath {
 impl WatchPath {
     pub fn path(&self) -> &std::path::Path {
         &self.path
+    }
+
+    #[allow(dead_code)]
+    pub fn ignore_patterns(&self) -> &[String] {
+        &self.ignore_patterns
     }
 }

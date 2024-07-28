@@ -1,4 +1,4 @@
-use self::intent::IntentList;
+use self::{error::RescanError, intent::IntentList};
 use crate::{
     journal::{Journal, OldVersion},
     worker::intent::{IntentKind, WorkerIntent},
@@ -76,30 +76,47 @@ impl Worker {
         let entry = if let Some(entry) = entry {
             entry
         } else {
+            let watch_path = config
+                .find_watch_path(&file_path)
+                .expect("No such watch path");
+
+            let relative_path = file_path
+                .strip_prefix(watch_path.path())
+                .expect("Invalid file path");
+
+            let mut backup_path = base_path.join(relative_path);
+            let file_name = backup_path
+                .file_name()
+                .expect("Backup path has `..` as file name.")
+                .to_string_lossy()
+                .into_owned();
+
+            let mut counter = 0;
+            while backup_path.exists() {
+                let file_name = format!("{}.{counter}", file_name);
+                backup_path.set_file_name(file_name);
+                counter += 1;
+            }
+
             let new_entry = journal_lck
                 .create_entry(
                     config
                         .find_watch_path(&file_path)
                         .expect("No such watch path"),
                     file_path.clone(),
+                    backup_path,
                 )
                 .await;
             new_entry.expect("Failed to create new journal entry")
         };
 
-        let relative_path = file_path
-            .strip_prefix(&entry.watch_path)
-            .expect("Invalid file path");
-
-        let backup_path = base_path.join(relative_path);
-
-        if let Some(parent) = backup_path.parent() {
+        if let Some(parent) = &entry.backup_path.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
                 .expect("Failed to create backup path directories");
         }
 
-        tokio::fs::copy(file_path, backup_path)
+        tokio::fs::copy(file_path, &entry.backup_path)
             .await
             .expect("Failed to backup file");
     }
@@ -111,7 +128,6 @@ impl Worker {
     ) {
         let mut journal_lck = journal.write().await;
 
-        let base_path = journal_lck.base_path().to_owned();
         let entry_guard = journal_lck.find_entry_mut(&file_path);
         if let Some(mut entry) = entry_guard {
             let mut file = tokio::fs::File::open(&file_path)
@@ -127,12 +143,7 @@ impl Worker {
                 .expect("Failed to calculate modification timestamp")
                 .as_secs();
 
-            let relative_path = entry
-                .file_path
-                .strip_prefix(&entry.watch_path)
-                .expect("Failed to compute relative path");
-
-            let backup_path = base_path.join(relative_path);
+            let backup_path = entry.backup_path.clone();
 
             if backup_path.exists() {
                 // TODO: For large files, this method of computing their hashes will likely cause
@@ -184,10 +195,12 @@ impl Worker {
                     .to_string_lossy()
             ));
 
-            tracing::info!(old_path = ?backup_path, new_path = ?old_version_path, "Renaming old file.");
-            tokio::fs::rename(&backup_path, &old_version_path)
-                .await
-                .expect("Failed to rename old file");
+            if backup_path.exists() {
+                tracing::info!(old_path = ?backup_path, new_path = ?old_version_path, "Renaming old file.");
+                tokio::fs::rename(&backup_path, &old_version_path)
+                    .await
+                    .expect("Failed to rename old file");
+            }
 
             entry.old_versions.push(OldVersion {
                 timestamp: old_timestamp,
@@ -221,39 +234,18 @@ impl Worker {
         match message {
             WorkerMessage::FilesystemEvent(notify::Event { paths, kind, .. }) => match kind {
                 EventKind::Create(CreateKind::File) => {
-                    let watch_paths = paths
-                        .iter()
-                        .flat_map(|p| config.find_watch_path(p))
-                        .zip(paths.iter());
-                    let mut journal = journal.write().await;
+                    let journal = journal.read().await;
 
-                    for (watch_path, file_path) in watch_paths {
+                    for file_path in &paths {
                         if journal.find_entry(file_path).is_some() {
                             tracing::warn!("Got a creation event, but journal entry exists. Skipping creation step...");
-                        } else {
-                            let span =
-                                tracing::info_span!("create_journal_entry", path = ?file_path);
-
-                            let new_entry = journal
-                                .create_entry(watch_path, file_path)
-                                .instrument(span)
-                                .await;
-
-                            match new_entry {
-                                Ok(_) => {
-                                    if !intent_list.has_intent_for(file_path) {
-                                        tracing::trace!("Creating new file creation intent.");
-                                        intent_list.create(WorkerIntent {
-                                            kind: IntentKind::Create,
-                                            path: file_path.to_owned(),
-                                            timestamp: SystemTime::now(),
-                                        })
-                                    }
-                                }
-                                Err(err) => {
-                                    tracing::error!(error = %err, "Failed to create journal entry.");
-                                }
-                            }
+                        } else if !intent_list.has_intent_for(file_path) {
+                            tracing::trace!("Creating new file creation intent.");
+                            intent_list.create(WorkerIntent {
+                                kind: IntentKind::Create,
+                                path: file_path.to_owned(),
+                                timestamp: SystemTime::now(),
+                            })
                         }
                     }
                 }
@@ -380,7 +372,16 @@ impl Worker {
                     if let Some(msg) = msg {
                         tracing::trace!(msg = ?msg, "Worker received message.");
                         let msg_span = tracing::info_span!("message_handler", msg = %msg);
-                        handles.push(tokio::task::spawn(Self::handle_message(msg, config.clone(), Arc::clone(&journal), intent_list.clone()).instrument(msg_span)));
+                        handles.push(
+                            tokio::task::spawn(
+                                Self::handle_message(
+                                    msg,
+                                    config.clone(),
+                                    Arc::clone(&journal),
+                                    intent_list.clone()
+                                ) .instrument(msg_span)
+                            )
+                        );
                     } else {
                         break;
                     }
@@ -391,9 +392,20 @@ impl Worker {
                             stale_intent_count = intent_list.len(),
                             "A status tick has happened and the intent list is not empty."
                         );
-                        for intent in intent_list.remove_stale(Duration::from_secs(60)) {
+
+                        // TODO: This code causes a deadlock
+                        let stale = intent_list.remove_stale(Duration::from_secs(20));
+                        for intent in stale {
+                            tracing::trace!(intent = ?intent, "Handling stale intent.");
                             let file_path = intent.path.to_owned();
-                            Self::handle_intent(config.clone(), intent, file_path, Arc::clone(&journal)).await;
+                            handles.push(
+                                tokio::spawn(Self::handle_intent(
+                                    config.clone(),
+                                    intent,
+                                    file_path,
+                                    Arc::clone(&journal)
+                                ))
+                            );
                         }
                     }
                 },
@@ -408,6 +420,83 @@ impl Worker {
                 tracing::warn!(error = %err, "Failed to join message handler.");
             }
         }
+    }
+
+    #[async_recursion::async_recursion]
+    pub async fn enumerate_files(
+        path: &std::path::Path,
+    ) -> Result<Vec<std::path::PathBuf>, tokio::io::Error> {
+        if path.is_file() {
+            Ok(vec![path.to_owned()])
+        } else {
+            let mut files = Vec::new();
+            let mut read_dir = tokio::fs::read_dir(path).await?;
+            while let Some(entry) = read_dir.next_entry().await? {
+                let file_type = entry.file_type().await?;
+                if file_type.is_file() {
+                    files.push(entry.path());
+                } else if file_type.is_dir() {
+                    let recursive_files = Self::enumerate_files(&entry.path()).await?;
+                    files.extend(recursive_files);
+                }
+            }
+            Ok(files)
+        }
+    }
+
+    pub async fn rescan(config: Config, journal: Arc<RwLock<Journal>>) -> Result<(), RescanError> {
+        let mut modified_files = vec![];
+        let mut new_files = vec![];
+
+        let journal_lck = journal.read().await;
+
+        for watch_path in &config.watch_paths {
+            let path = watch_path.path();
+            let files = Self::enumerate_files(path).await?;
+            for path in files {
+                let meta = path.metadata()?;
+                if let Some(entry) = journal_lck.find_entry(&path) {
+                    let timestamp = meta.modified()?.duration_since(UNIX_EPOCH)?.as_secs();
+                    if timestamp > entry.last_modified {
+                        modified_files.push(path);
+                    }
+                } else {
+                    new_files.push(path);
+                }
+            }
+        }
+
+        drop(journal_lck);
+
+        for new_file in new_files {
+            Self::handle_intent(
+                config.clone(),
+                WorkerIntent {
+                    path: new_file.clone(),
+                    kind: IntentKind::Create,
+                    timestamp: SystemTime::now(),
+                },
+                new_file,
+                Arc::clone(&journal),
+            )
+            .await;
+        }
+
+        for modified in modified_files {
+            Self::handle_intent(
+                config.clone(),
+                WorkerIntent {
+                    path: modified.clone(),
+                    kind: IntentKind::Modify,
+                    timestamp: SystemTime::now(),
+                },
+                modified,
+                Arc::clone(&journal),
+            )
+            .await;
+        }
+
+        Ok(())
     }
 
     pub async fn wait_for_shutdown(self) -> Result<(), tokio::task::JoinError> {

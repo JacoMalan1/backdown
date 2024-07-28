@@ -85,6 +85,7 @@ impl Journal {
         &mut self,
         watch_path: &WatchPath,
         path: P,
+        backup_path: P,
     ) -> Result<&JournalEntry, JournalError>
     where
         P: AsRef<Path>,
@@ -95,10 +96,12 @@ impl Journal {
         let meta = file.metadata().await?;
 
         let entry = JournalEntry {
-            file_path: PathBuf::from(path.as_ref()),
+            file_path: path.as_ref().to_owned(),
+            backup_path: backup_path.as_ref().to_owned(),
             last_modified: meta.modified()?.duration_since(UNIX_EPOCH)?.as_secs(),
             watch_path: watch_path.path().to_owned(),
             old_versions: vec![],
+            deleted: None,
         };
 
         self.entries.insert(entry.file_path.clone(), entry);
@@ -158,7 +161,11 @@ impl Journal {
 pub struct JournalEntry {
     pub file_path: std::path::PathBuf,
     pub watch_path: std::path::PathBuf,
+    pub backup_path: std::path::PathBuf,
     pub last_modified: u64,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deleted: Option<u64>,
 
     #[serde(default = "Vec::default")]
     pub old_versions: Vec<OldVersion>,

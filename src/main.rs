@@ -38,7 +38,7 @@ fn config_location() -> PathBuf {
 #[tokio::main]
 async fn main() -> Result<(), std::io::Error> {
     tracing_subscriber::fmt()
-        .with_max_level(LevelFilter::INFO)
+        .with_max_level(LevelFilter::TRACE)
         .init();
 
     let span = tracing::info_span!("main");
@@ -77,12 +77,12 @@ async fn main() -> Result<(), std::io::Error> {
     ));
 
     let mut worker = Worker::new(cancel.clone(), Arc::clone(&journal), config.clone());
-    let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
     let mut watcher = notify::recommended_watcher(move |res| match res {
         Ok(event) => {
             tracing::trace!(ev = ?event, "Filesystem event.");
-            tx.blocking_send(WorkerMessage::FilesystemEvent(event))
+            tx.send(WorkerMessage::FilesystemEvent(event))
                 .expect("Failed to send message to actor thread");
         }
         Err(err) => tracing::error!(error = %err, "Watch error"),
@@ -94,6 +94,10 @@ async fn main() -> Result<(), std::io::Error> {
             .watch(path.path(), RecursiveMode::Recursive)
             .expect("Failed to watch path");
     });
+
+    if let Err(err) = worker::Worker::rescan(config.clone(), Arc::clone(&journal)).await {
+        tracing::error!(error = %err, "Filesystem rescan failed.");
+    }
 
     let interval_journal = Arc::clone(&journal);
     let interval_cancel = cancel.clone();
@@ -127,6 +131,9 @@ async fn main() -> Result<(), std::io::Error> {
         .instrument(interval_span),
     );
 
+    let mut rescan_interval =
+        tokio::time::interval(Duration::from_secs(config.fs_refresh_timeout_secs));
+
     loop {
         tokio::select! {
             msg = rx.recv() => {
@@ -139,6 +146,11 @@ async fn main() -> Result<(), std::io::Error> {
                     break
                 }
             },
+            _ = rescan_interval.tick() => {
+                if let Err(err) = worker::Worker::rescan(config.clone(), Arc::clone(&journal)).await {
+                    tracing::error!(error = %err, "Filesystem rescan failed.");
+                }
+            }
             _ = tokio::signal::ctrl_c() => {
                 break;
             }
