@@ -31,7 +31,7 @@ fn config_location() -> PathBuf {
         .or(std::env::var("HOME").map(|s| format!("{s}/.config")))
         .unwrap_or("/etc".to_string());
 
-    PathBuf::from_str(&format!("{base_dir}/backdown/config.ron"))
+    PathBuf::from_str(&format!("{base_dir}/vertebrae/config.ron"))
         .expect("Failed to compute config file location")
 }
 
@@ -67,7 +67,7 @@ async fn main() -> Result<(), std::io::Error> {
     }
 
     let mut journal_path = base_path.clone();
-    journal_path.push(".backdown.journal.json");
+    journal_path.push(".vertebrae.journal.json");
 
     let cancel = CancellationToken::new();
     let journal = Arc::new(RwLock::new(
