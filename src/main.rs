@@ -37,9 +37,7 @@ fn config_location() -> PathBuf {
 
 #[tokio::main]
 async fn main() -> Result<(), std::io::Error> {
-    tracing_subscriber::fmt()
-        .with_max_level(LevelFilter::TRACE)
-        .init();
+    tracing_subscriber::fmt().with_max_level(LOG_LEVEL).init();
 
     let span = tracing::info_span!("main");
     let _guard = span.enter();
