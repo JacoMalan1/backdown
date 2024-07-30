@@ -178,6 +178,21 @@ impl FileHandler {
             self.create(file_path).await
         }
     }
+
+    pub async fn remove<P>(&self, file_path: P) -> Result<(), HandleFileError>
+    where
+        P: AsRef<std::path::Path>,
+    {
+        let mut journal = self.journal.write().await;
+        let entry_guard = journal.find_entry_mut(&file_path);
+        if let Some(mut entry) = entry_guard {
+            entry.deleted = Some(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs());
+            Ok(())
+        } else {
+            tracing::warn!(file_path = ?file_path.as_ref(), "Remove event fired on file not in journal. Ignoring it ...");
+            Ok(())
+        }
+    }
 }
 
 impl Clone for FileHandler {

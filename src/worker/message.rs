@@ -1,24 +1,21 @@
-use std::{
-    sync::Arc,
-    time::{Duration, SystemTime},
-};
-
-use notify::{
-    event::{AccessKind, AccessMode, CreateKind},
-    EventKind,
-};
-use thiserror::Error;
-use tokio::sync::RwLock;
-
-use crate::{
-    journal::Journal,
-    worker::intent::{IntentKind, WorkerIntent},
-};
-
 use super::{
     file::FileHandler,
     intent::{IntentHandler, IntentList},
 };
+use crate::{
+    journal::Journal,
+    worker::intent::{IntentKind, WorkerIntent},
+};
+use notify::{
+    event::{AccessKind, AccessMode, CreateKind},
+    EventKind,
+};
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+use thiserror::Error;
+use tokio::sync::RwLock;
 
 #[derive(Debug, Clone)]
 pub enum WorkerMessage {
@@ -132,7 +129,13 @@ impl MessageHandler {
                         }
                     }
                 }
-                EventKind::Remove(_remove_kind) => todo!("Handle inode destruction"),
+                EventKind::Remove(_) => {
+                    for file_path in &paths {
+                        if let Err(err) = self.file_handler.remove(file_path).await {
+                            tracing::error!(error = %err, "Failed to remove file.");
+                        }
+                    }
+                }
                 _ => (),
             },
         }
