@@ -67,7 +67,7 @@ impl Worker {
         mut event_rx: Receiver<WorkerMessage>,
         cancel: CancellationToken,
         intent_list: IntentList,
-        intent_handler: IntentHandler,
+        _intent_handler: IntentHandler,
         message_handler: MessageHandler,
     ) {
         let mut cancelled = std::pin::pin!(cancel.cancelled());
@@ -93,26 +93,26 @@ impl Worker {
                 },
                 _ = interval.tick() => {
                     if !intent_list.is_empty() {
-                        tracing::warn!(
-                            stale_intent_count = intent_list.len(),
-                            "A status tick has happened and the intent list is not empty."
-                        );
+                        // tracing::warn!(
+                        //     stale_intent_count = intent_list.len(),
+                        //     "A status tick has happened and the intent list is not empty."
+                        // );
 
                         // TODO: This code causes a deadlock
-                        let stale = intent_list.remove_stale(Duration::from_secs(20));
-                        for intent in stale {
-                            tracing::trace!(intent = ?intent, "Handling stale intent.");
-                            let file_path = intent.path.to_owned();
-                            let intent_handler = intent_handler.clone();
-                            handles.push(
-                                tokio::spawn(async move {
-                                    let _ = intent_handler.handle(
-                                        file_path,
-                                        intent,
-                                    ).await;
-                                })
-                            );
-                        }
+                        // let stale = intent_list.remove_stale(Duration::from_secs(20));
+                        // for intent in stale {
+                        //     tracing::trace!(intent = ?intent, "Handling stale intent.");
+                        //     let file_path = intent.path.to_owned();
+                        //     let intent_handler = intent_handler.clone();
+                        //     handles.push(
+                        //         tokio::spawn(async move {
+                        //             let _ = intent_handler.handle(
+                        //                 file_path,
+                        //                 intent,
+                        //             ).await;
+                        //         })
+                        //     );
+                        // }
                     }
                 },
                 _ = &mut cancelled => {
